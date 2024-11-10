@@ -7,10 +7,8 @@ from rclpy.node import Node
 from geometry_msgs.msg import Pose2D, Twist
 
 import socket
-import sys
-sys.path.append('/home/gus/ufg/SSL/ros2_ws/src/my_package/my_package')
 
-from messages_robocup_ssl_wrapper_pb2 import SSL_WrapperPacket
+from .messages.messages_robocup_ssl_wrapper_pb2 import SSL_WrapperPacket
 
 
 
@@ -28,8 +26,10 @@ class SSLVisionProtobufToROS(Node):
                 ('frequency', 60),
             ]
         )
-        self.blue_robot_count = self.get_parameter('blue_robot_count').get_parameter_value().integer_value
-        self.yellow_robot_count = self.get_parameter('yellow_robot_count').get_parameter_value().integer_value
+        self.robot_count = {}
+        self.robot_count['blue'] = self.get_parameter('blue_robot_count').get_parameter_value().integer_value
+        self.robot_count['yellow'] = self.get_parameter('yellow_robot_count').get_parameter_value().integer_value
+
         frequency = self.get_parameter('frequency').get_parameter_value().integer_value
         time_step_ms = 1000 // frequency
 
@@ -44,51 +44,40 @@ class SSLVisionProtobufToROS(Node):
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
         self.sock.bind((self.ssl_vision_ip, self.ssl_vision_port))
 
-
-
         self.ball_publisher = self.create_publisher(Pose2D, '/simulator/poses/ball', 10)
 
-        # /simulator/robots_poses/blue/0, /simulator/robots_poses/blue/1, ...
-        self.pose_publishers = []
-        for i in range(self.blue_robot_count):
-            self.pose_publishers.append(
+
+
+        self.pose_publishers = {}
+        self.pose_publishers['blue'] = []
+        self.pose_publishers['yellow'] = []
+
+        for i in range(self.robot_count['blue']):
+            self.pose_publishers['blue'].append(
                 self.create_publisher(Pose2D, f'/simulator/poses/blue/robot{i}', 10)
             )
-        for i in range(self.yellow_robot_count):
-            self.pose_publishers.append(
+        for i in range(self.robot_count['yellow']):
+            self.pose_publishers['yellow'].append(
                 self.create_publisher(Pose2D, f'/simulator/poses/yellow/robot{i}', 10)
             )
 
-        self.yellow_robot_id_presence_counter = [0 for i in range(16)]
-        self.blue_robot_id_presence_counter = [0 for i in range(16)]
+        self.presence_counter = {}
+        self.presence_counter['blue'] = [0 for i in range(16)]
+        self.presence_counter['yellow'] = [0 for i in range(16)]
         
         timer_period = time_step_ms / 1000.0  # seconds
         self.timer = self.create_timer(timer_period, self.get_protobuf_and_publish)
 
-        self.get_logger().info('Protobuf Connector Node Started')
+        self.get_logger().info('SSL Vision Protobuf Connector Node Started')
 
     
-    def get_blue_robot_id_converter(self):
-        print("Blue presence counter: ", self.blue_robot_id_presence_counter)
-        blue_robot_list = [(count, id) for id, count in enumerate(self.blue_robot_id_presence_counter)]
-        print("Blue robot list: ", blue_robot_list)
-        sorted_by_count = sorted(blue_robot_list, key=lambda x: x[0], reverse=True)
+    def get_robot_id_converter(self, color: str ):
+        print(color, "presence counter: ", self.presence_counter[color])
+        robot_list = [(count, id) for id, count in enumerate(self.presence_counter[color])]
+        print(color, "robot list: ", robot_list)
+        sorted_by_count = sorted(robot_list, key=lambda x: x[0], reverse=True)
         print("sorted by count: ", sorted_by_count)
-        top_k = sorted_by_count[:self.blue_robot_count]
-        print("top k: ", top_k)
-        sorted_by_id = sorted(top_k, key=lambda x: x[1])
-        print("sorted_by_id: ", sorted_by_id)
-        converter = [pair[1] for pair in sorted_by_id]
-        print("converter: ", converter)
-        return converter
-
-    def get_yellow_robot_id_converter(self):
-        print("yellow presence counter: ", self.yellow_robot_id_presence_counter)
-        yellow_robot_list = [(count, id) for id, count in enumerate(self.yellow_robot_id_presence_counter)]
-        print("yellow robot list: ", yellow_robot_list)
-        sorted_by_count = sorted(yellow_robot_list, key=lambda x: x[0], reverse=True)
-        print("sorted by count: ", sorted_by_count)
-        top_k = sorted_by_count[:self.yellow_robot_count]
+        top_k = sorted_by_count[:self.robot_count[color]]
         print("top k: ", top_k)
         sorted_by_id = sorted(top_k, key=lambda x: x[1])
         print("sorted_by_id: ", sorted_by_id)
@@ -99,29 +88,46 @@ class SSLVisionProtobufToROS(Node):
     def decay_presence_counter(self):
         DECAY_PARAMETER = 0.9
 
-        for i in range(len(self.yellow_robot_id_presence_counter)):
-            self.yellow_robot_id_presence_counter[i] *= DECAY_PARAMETER
+        for i in range(len(self.presence_counter['yellow'])):
+            self.presence_counter['yellow'][i] *= DECAY_PARAMETER
 
-        for i in range(len(self.blue_robot_id_presence_counter)):
-            self.blue_robot_id_presence_counter[i] *= DECAY_PARAMETER
+        for i in range(len(self.presence_counter['blue'])):
+            self.presence_counter['blue'][i] *= DECAY_PARAMETER
         
         #print("Blue presence counter: ", self.blue_robot_id_presence_counter)
         #print("Yellow presence counter: ", self.yellow_robot_id_presence_counter)
         
     def increase_presence_counter(self, ssl_protobuf_packet):
         for yellow_robot in ssl_protobuf_packet.detection.robots_yellow:
-            self.yellow_robot_id_presence_counter[yellow_robot.robot_id] += 1
+            self.presence_counter['yellow'][yellow_robot.robot_id] += 1
         for blue_robot in ssl_protobuf_packet.detection.robots_blue:
-            self.blue_robot_id_presence_counter[blue_robot.robot_id] += 1
+            self.presence_counter['blue'][blue_robot.robot_id] += 1
         
 
 
+    def check_and_publish_robot(self, robot, robot_id_converter, publishers):
+            print(robot)
+
+            if robot.robot_id not in robot_id_converter:
+                # This means the robot that was detected might be a flicker of the vision system
+                print("Robot id", robot.robot_id, "is not in the top k robots, classifying as flicker")
+                return
+            else:
+                index = robot_id_converter.index(robot.robot_id)
+                print("Robot ", robot.robot_id, " has a ros id of", index)
+
+            msg = Pose2D()
+            msg.x = robot.x / 1000
+            msg.y = robot.y / 1000
+            msg.theta = robot.orientation
+            publishers[index].publish(msg)
 
 
     def get_protobuf_and_publish(self):
         # Get converter from robot_id to our 0 to robot_count IDs
-        blue_robot_id_converter = self.get_blue_robot_id_converter()
-        yellow_robot_id_converter = self.get_yellow_robot_id_converter()
+        robot_id_converter = {}
+        robot_id_converter['blue'] = self.get_robot_id_converter('blue')
+        robot_id_converter['yellow'] = self.get_robot_id_converter('yellow')
 
         # Units are meters, meters/s, degrees
         # state is [ball_x, ball_y, ball_z, ball_v_x, ball_v_y,
@@ -153,38 +159,10 @@ class SSLVisionProtobufToROS(Node):
             
         
         for blue_robot in ssl_protobuf_packet.detection.robots_blue:
-            print(blue_robot)
-
-            if blue_robot.robot_id not in blue_robot_id_converter:
-                # This means the robot that was detected might be a flicker of the vision system
-                print("Robot id", blue_robot.robot_id, "is not in the top k robots, classifying as flicker")
-                continue
-            else:
-                index = blue_robot_id_converter.index(blue_robot.robot_id)
-                print("Robot ", blue_robot.robot_id, " has a ros id of", index)
-
-            msg = Pose2D()
-            msg.x = blue_robot.x
-            msg.y = blue_robot.y
-            msg.theta = blue_robot.orientation
-            self.pose_publishers[index].publish(msg)
+            self.check_and_publish_robot(blue_robot, robot_id_converter['blue'], self.pose_publishers['blue'])
         
         for yellow_robot in ssl_protobuf_packet.detection.robots_yellow:
-            print(yellow_robot)
-
-            if yellow_robot.robot_id not in yellow_robot_id_converter:
-                # This means the robot that was detected might be a flicker of the vision system
-                print("Robot id", yellow_robot.robot_id, "is not in the top k robots, classifying as flicker")
-                continue
-            else:
-                index = yellow_robot_id_converter.index(yellow_robot.robot_id)
-                print("Robot ", yellow_robot.robot_id, " has a ros id of", index)
-
-            msg = Pose2D()
-            msg.x = yellow_robot.x
-            msg.y = yellow_robot.y
-            msg.theta = yellow_robot.orientation
-            self.pose_publishers[self.blue_robot_count + index].publish(msg)
+            self.check_and_publish_robot(yellow_robot, robot_id_converter['yellow'], self.pose_publishers['yellow'])
 
 def main(args=None):
     rclpy.init(args=args)
